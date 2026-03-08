@@ -1,480 +1,578 @@
 #!/usr/bin/env python3
-"""
-apply_llm_patch.py
+"""apply_llm_patch.py
 
-Windows-friendly helper for applying LLM-generated patches.
+Apply a unified diff (often produced by an LLM) to the current working tree.
 
-Features
-- Standard attempt first: calls codex_apply_patch.apply_patch(...) directly.
-- If that fails or produces no detected file changes, asks for confirmation
-  (default: Yes) and retries with a best-effort patch cleanup pass.
-- Supports --clipboard to read the patch from the current clipboard.
-- Supports --install-deps to install required dependencies.
-- Supports --help.
+Key features
+- Tries to apply using `codex_apply_patch` if available.
+- Normalizes common wrong paths in LLM diffs (especially `/mnt/data/<something>/...`).
+- If the standard apply fails, prompts (default Yes) to attempt a best-effort apply.
+- Supports `--clipboard` to read the patch from the clipboard.
+- Supports `--install-deps` to attempt installing optional dependencies.
 
-Notes
-- Best effort currently means: extract fenced patch content, normalize
-  newlines, drop UTF-8 BOM, normalize whitespace-only hunk lines, repair
-  missing leading context markers in apply_patch hunks, then retry.
-- This script is intentionally conservative: it does not try to invent patch
-  content or silently rewrite files without asking.
+Usage
+  python apply_llm_patch.py PATCH.diff
+  python apply_llm_patch.py --clipboard
+  python apply_llm_patch.py PATCH.diff --best-effort
+
+Exit codes
+  0 success
+  1 error
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
+import inspect
 import os
 import re
 import subprocess
 import sys
-import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
-
-PACKAGE_NAME = "codex-apply-patch"
-IMPORT_NAME = "codex_apply_patch"
+from typing import Dict, List, Optional, Sequence, Tuple
 
 
-@dataclass
-class FileState:
-    exists: bool
-    sha256: Optional[str]
-    size: Optional[int]
+# ----------------------------
+# Utilities
+# ----------------------------
 
-
-@dataclass
-class ApplyResult:
-    ok: bool
-    changed_files: List[str]
-    message: str
-    exception_text: Optional[str] = None
-
-
-def eprint(*args: object) -> None:
+def _eprint(*args: object) -> None:
     print(*args, file=sys.stderr)
 
 
-def read_clipboard_text() -> str:
-    try:
-        import tkinter as tk
-    except Exception as exc:
-        raise RuntimeError(
-            "Could not import tkinter to read the clipboard. "
-            "On Windows, install a normal Python build that includes tkinter, "
-            "or use a patch file instead of --clipboard."
-        ) from exc
-
-    try:
-        root = tk.Tk()
-        root.withdraw()
+def _read_text_file(path: Path) -> Tuple[str, str]:
+    """Read text with a small encoding fallback, returning (text, encoding_used)."""
+    # Keep this conservative; most web assets are UTF-8.
+    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
         try:
-            text = root.clipboard_get()
+            return path.read_text(encoding=enc), enc
+        except UnicodeDecodeError:
+            continue
+    # Last resort: replace.
+    return path.read_text(encoding="utf-8", errors="replace"), "utf-8"
+
+
+def _write_text_file(path: Path, text: str, encoding: str) -> None:
+    path.write_text(text, encoding=encoding)
+
+
+def _read_clipboard_text() -> str:
+    """Read text from clipboard using tkinter (built-in)."""
+    try:
+        import tkinter  # type: ignore
+
+        r = tkinter.Tk()
+        r.withdraw()
+        try:
+            data = r.clipboard_get()
         finally:
-            root.destroy()
-        if not isinstance(text, str) or text == "":
-            raise RuntimeError("The clipboard is empty or does not contain text.")
-        return text
+            r.destroy()
+        return data
     except Exception as exc:
         raise RuntimeError(
-            "Could not read text from the clipboard. "
-            "Make sure the patch text is currently copied."
-        ) from exc
+            "Failed to read from clipboard. "
+            "On Windows, clipboard access via tkinter can fail in some environments. "
+            "Try passing a patch filename instead.\n" + str(exc)
+        )
 
 
-def install_deps() -> int:
-    cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "pip", PACKAGE_NAME]
-    print("Installing dependencies:")
-    print(" ", " ".join(cmd))
-    proc = subprocess.run(cmd)
-    if proc.returncode == 0:
-        print("Dependencies installed successfully.")
-    else:
-        eprint("Dependency installation failed.")
-    return proc.returncode
-
-
-def import_codex_apply_patch():
+def _prompt_yes_no(question: str, default_yes: bool = True) -> bool:
+    suffix = " [Y/n] " if default_yes else " [y/N] "
     try:
-        import codex_apply_patch as cap
+        resp = input(question + suffix).strip().lower()
+    except EOFError:
+        return default_yes
+    if not resp:
+        return default_yes
+    if resp in ("y", "yes"):
+        return True
+    if resp in ("n", "no"):
+        return False
+    return default_yes
+
+
+def _run_pip_install(packages: Sequence[str]) -> int:
+    cmd = [sys.executable, "-m", "pip", "install", "-U", *packages]
+    _eprint("Running:", " ".join(cmd))
+    return subprocess.call(cmd)
+
+
+# ----------------------------
+# Patch path normalization
+# ----------------------------
+
+_HEADER_RE = re.compile(r"^(---|\+\+\+)\s+(.*)$")
+
+
+def _split_header_path_and_rest(after_marker: str) -> Tuple[str, str]:
+    """Split '<path>\t<rest>' or '<path> <rest>' preserving rest (including leading ws)."""
+    s = after_marker
+    # Keep newline in rest if present.
+    if "\t" in s:
+        p, rest = s.split("\t", 1)
+        return p, "\t" + rest
+    # Some diffs separate timestamps by spaces.
+    # We split on the first space, but only if there is something after it.
+    if " " in s:
+        p, rest = s.split(" ", 1)
+        return p, " " + rest
+    return s.rstrip("\n"), "\n" if s.endswith("\n") else ""
+
+
+def _strip_a_b_prefix(path: str) -> str:
+    if path.startswith("a/") or path.startswith("b/"):
+        return path[2:]
+    return path
+
+
+def _normalize_llm_path_token(path: str) -> str:
+    """Normalize a diff path token to something likely present in the local working tree."""
+    p = path.strip()
+    if p == "/dev/null":
+        return p
+
+    # Normalize slashes.
+    p = p.replace("\\", "/")
+    p = _strip_a_b_prefix(p)
+    while p.startswith("./"):
+        p = p[2:]
+
+    # The common LLM failure: absolute sandbox paths like /mnt/data/<something>/...
+    if p.startswith("/mnt/data/"):
+        parts = [x for x in p.split("/") if x]
+        # parts: ["mnt", "data", "something", ...]
+        if len(parts) >= 4:
+            p2 = "/".join(parts[3:])
+            return p2 or parts[-1]
+        return parts[-1]
+
+    # For any other absolute path, keep only the basename (conservative).
+    if re.match(r"^[A-Za-z]:/", p) or p.startswith("/"):
+        return Path(p).name
+
+    return p
+
+
+def _find_unique_by_basename(repo_root: Path, basename: str) -> Optional[Path]:
+    matches = [p for p in repo_root.rglob(basename) if p.is_file()]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _resolve_patch_target_path(
+    repo_root: Path,
+    norm_new: str,
+    norm_old: str,
+) -> str:
+    """Choose a target path (relative to repo_root) for a file diff."""
+    candidates: List[str] = []
+    for c in (norm_new, norm_old):
+        if c and c != "/dev/null":
+            candidates.append(c)
+
+    # Prefer any candidate that exists as-is.
+    for c in candidates:
+        if (repo_root / c).is_file():
+            return c
+
+    # Then try basename within repo root.
+    for c in candidates:
+        b = Path(c).name
+        if (repo_root / b).is_file():
+            return b
+
+    # Then try unique recursive match by basename.
+    for c in candidates:
+        b = Path(c).name
+        found = _find_unique_by_basename(repo_root, b)
+        if found is not None:
+            return str(found.relative_to(repo_root)).replace("\\", "/")
+
+    # Fall back to norm_new if present, else norm_old.
+    return (norm_new if norm_new and norm_new != "/dev/null" else norm_old)
+
+
+def normalize_patch_paths(patch_text: str, repo_root: Path) -> Tuple[str, Dict[str, str]]:
+    """Rewrite ---/+++ header paths to match local paths.
+
+    Returns (normalized_patch_text, mapping) where mapping maps original header path tokens
+    to the resolved local relative path.
+    """
+    lines = patch_text.splitlines(keepends=True)
+    mapping: Dict[str, str] = {}
+
+    i = 0
+    while i < len(lines) - 1:
+        if lines[i].startswith("--- ") and lines[i + 1].startswith("+++ "):
+            old_line = lines[i]
+            new_line = lines[i + 1]
+
+            old_after = old_line[4:]
+            new_after = new_line[4:]
+
+            old_path_raw, old_rest = _split_header_path_and_rest(old_after)
+            new_path_raw, new_rest = _split_header_path_and_rest(new_after)
+
+            old_norm = _normalize_llm_path_token(old_path_raw)
+            new_norm = _normalize_llm_path_token(new_path_raw)
+
+            target = _resolve_patch_target_path(repo_root, new_norm, old_norm)
+
+            # Only rewrite when a meaningful change is needed.
+            if target != new_path_raw or target != old_path_raw:
+                lines[i] = "--- " + target + old_rest
+                lines[i + 1] = "+++ " + target + new_rest
+
+            mapping[old_path_raw] = target
+            mapping[new_path_raw] = target
+
+            i += 2
+            continue
+        i += 1
+
+    return "".join(lines), mapping
+
+
+# ----------------------------
+# Best-effort unified diff applier
+# ----------------------------
+
+@dataclass
+class Hunk:
+    old_start: int
+    old_count: int
+    new_start: int
+    new_count: int
+    lines: List[str]  # includes leading ' ', '+', '-' (with trailing newline if present)
+
+
+@dataclass
+class FileDiff:
+    path: str
+    hunks: List[Hunk]
+
+
+_HUNK_RE = re.compile(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@")
+
+
+def _canonical_line(s: str) -> str:
+    return s.rstrip("\n").rstrip("\r")
+
+
+def _detect_newline_style(text: str) -> str:
+    # Prefer \r\n if present.
+    return "\r\n" if "\r\n" in text else "\n"
+
+
+def _parse_unified_diff(patch_text: str) -> List[FileDiff]:
+    lines = patch_text.splitlines(keepends=True)
+    out: List[FileDiff] = []
+    i = 0
+    while i < len(lines):
+        if lines[i].startswith("--- ") and i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
+            # Use the +++ path as the target (we normalize to the same path for both).
+            new_path_raw, _ = _split_header_path_and_rest(lines[i + 1][4:])
+            path = new_path_raw.strip()
+            i += 2
+            hunks: List[Hunk] = []
+            while i < len(lines) and lines[i].startswith("@@"):
+                m = _HUNK_RE.match(lines[i])
+                if not m:
+                    break
+                old_start = int(m.group(1))
+                old_count = int(m.group(2) or "1")
+                new_start = int(m.group(3))
+                new_count = int(m.group(4) or "1")
+                i += 1
+                hunk_lines: List[str] = []
+                while i < len(lines):
+                    if lines[i].startswith("@@") or lines[i].startswith("--- "):
+                        break
+                    if lines[i].startswith("\\ No newline at end of file"):
+                        i += 1
+                        continue
+                    if lines[i][:1] in (" ", "+", "-"):
+                        hunk_lines.append(lines[i])
+                        i += 1
+                        continue
+                    # Unknown line: stop this hunk.
+                    break
+                hunks.append(Hunk(old_start, old_count, new_start, new_count, hunk_lines))
+            out.append(FileDiff(path=path, hunks=hunks))
+            continue
+        i += 1
+    return out
+
+
+def _find_sublist(hay: List[str], needle: List[str]) -> List[int]:
+    if not needle:
+        return list(range(len(hay) + 1))
+    n = len(needle)
+    hits: List[int] = []
+    for i in range(0, len(hay) - n + 1):
+        if hay[i : i + n] == needle:
+            hits.append(i)
+    return hits
+
+
+def _apply_hunk_best_effort(
+    file_lines: List[str],
+    hunk: Hunk,
+    preferred_index: int,
+) -> Tuple[List[str], str]:
+    """Apply one hunk. Returns (new_lines, note)."""
+    # Build the "old" slice (context + deletions).
+    old_seq = [_canonical_line(x[1:]) for x in hunk.lines if x[:1] in (" ", "-")]
+    new_seq = [_canonical_line(x[1:]) for x in hunk.lines if x[:1] in (" ", "+")]
+
+    canon_file = [_canonical_line(x) for x in file_lines]
+
+    hits = _find_sublist(canon_file, old_seq)
+
+    if hits:
+        if preferred_index in hits:
+            idx = preferred_index
+            note = "applied at expected location"
+        elif len(hits) == 1:
+            idx = hits[0]
+            note = "applied at unique matching location (line numbers differed)"
+        else:
+            # Choose the closest hit to preferred index.
+            idx = min(hits, key=lambda h: abs(h - preferred_index))
+            note = "applied at closest matching location (multiple matches)"
+
+        before = file_lines[:idx]
+        after = file_lines[idx + len(old_seq) :]
+        # Preserve existing newline style by reusing the existing file line endings.
+        # We'll keep the file's dominant newline style for inserted lines.
+        newline_style = "\n"
+        if file_lines:
+            joined = "".join(file_lines)
+            newline_style = _detect_newline_style(joined)
+
+        # Reconstruct new lines with consistent newline style, unless the patch line had no newline.
+        rebuilt: List[str] = []
+        for raw in new_seq:
+            rebuilt.append(raw + newline_style)
+        # If the original file didn't end with newline and the last patch line likely shouldn't either,
+        # don't try to be too clever—keep as-is.
+
+        return before + rebuilt + after, note
+
+    # Fallback: try to match only context lines.
+    ctx_seq = [_canonical_line(x[1:]) for x in hunk.lines if x[:1] == " "]
+    ctx_hits = _find_sublist(canon_file, ctx_seq) if ctx_seq else []
+    if ctx_hits:
+        idx = min(ctx_hits, key=lambda h: abs(h - preferred_index))
+        note = "applied using context-only match (best-effort)"
+        # Apply by replacing at idx with new_seq, but only removing the context length.
+        before = file_lines[:idx]
+        after = file_lines[idx + len(ctx_seq) :]
+        newline_style = "\n"
+        if file_lines:
+            newline_style = _detect_newline_style("".join(file_lines))
+        rebuilt = [raw + newline_style for raw in new_seq]
+        return before + rebuilt + after, note
+
+    raise RuntimeError("Could not find a matching location for hunk")
+
+
+def apply_unified_diff_best_effort(patch_text: str, repo_root: Path) -> List[str]:
+    """Apply a unified diff without external dependencies.
+
+    Returns a list of human-readable status messages.
+    Raises on hard failures.
+    """
+    messages: List[str] = []
+    filediffs = _parse_unified_diff(patch_text)
+    if not filediffs:
+        raise RuntimeError("No file diffs found in patch text")
+
+    for fd in filediffs:
+        target = repo_root / fd.path
+        if not target.exists():
+            raise FileNotFoundError(f"Target file not found: {fd.path}")
+
+        original_text, enc = _read_text_file(target)
+        # Preserve original newline chars in memory.
+        # Keepends True so we don't lose line breaks.
+        file_lines = original_text.splitlines(keepends=True)
+
+        preferred = 0
+        for h in fd.hunks:
+            preferred = max(0, h.old_start - 1)
+            file_lines, note = _apply_hunk_best_effort(file_lines, h, preferred)
+            messages.append(f"{fd.path}: hunk -{h.old_start},+{h.new_start} {note}")
+
+        new_text = "".join(file_lines)
+        if new_text != original_text:
+            _write_text_file(target, new_text, enc)
+            messages.append(f"{fd.path}: wrote changes")
+        else:
+            messages.append(f"{fd.path}: no changes needed")
+
+    return messages
+
+
+# ----------------------------
+# codex_apply_patch integration
+# ----------------------------
+
+
+def try_apply_with_codex_apply_patch(patch_text: str) -> Tuple[bool, str]:
+    """Try applying with codex_apply_patch if available.
+
+    Returns (success, message).
+    """
+    try:
+        import codex_apply_patch as cap  # type: ignore
     except Exception as exc:
-        raise RuntimeError(
-            "Missing dependency: codex-apply-patch\n\n"
-            "Install it with one of these commands:\n"
-            f"  {sys.executable} -m pip install {PACKAGE_NAME}\n"
-            f"  {sys.executable} {Path(__file__).name} --install-deps\n"
-        ) from exc
-    return cap
+        return False, (
+            "codex_apply_patch is not importable. "
+            "If you want to use it, install it (or run with --install-deps).\n" + str(exc)
+        )
 
+    if not hasattr(cap, "apply_patch"):
+        return False, "codex_apply_patch has no apply_patch() symbol."
 
-def read_patch_text(path_arg: Optional[str], use_clipboard: bool) -> str:
-    if use_clipboard:
-        return read_clipboard_text()
+    fn = getattr(cap, "apply_patch")
 
-    if not path_arg or path_arg == "-":
-        data = sys.stdin.buffer.read()
-    else:
-        data = Path(path_arg).read_bytes()
-
-    if data.startswith(b"\xef\xbb\xbf"):
-        data = data[3:]
-    return data.decode("utf-8", errors="replace")
-
-
-def extract_patch_from_markdown(text: str) -> str:
-    fence_re = re.compile(r"```[^\n]*\n(.*?)\n```", re.S)
-    blocks = fence_re.findall(text)
-    if not blocks:
-        return text
-
-    scored: List[Tuple[int, str]] = []
-    for block in blocks:
-        score = 0
-        if "*** Begin Patch" in block and "*** End Patch" in block:
-            score += 100
-        if "diff --git" in block:
-            score += 80
-        if re.search(r"^---\s", block, re.M) and re.search(r"^\+\+\+\s", block, re.M):
-            score += 60
-        score += min(len(block), 1000) // 100
-        scored.append((score, block))
-
-    scored.sort(key=lambda item: item[0], reverse=True)
-    return scored[0][1]
-
-
-def normalize_newlines(text: str) -> str:
-    return text.replace("\r\n", "\n").replace("\r", "\n")
-
-
-def detect_format(text: str) -> str:
-    if "*** Begin Patch" in text and "*** End Patch" in text:
-        return "apply_patch"
-    if "diff --git" in text:
-        return "unified"
-    if re.search(r"^---\s", text, re.M) and re.search(r"^\+\+\+\s", text, re.M):
-        return "unified"
-    return "unknown"
-
-
-def parse_target_files(text: str) -> List[str]:
-    fmt = detect_format(text)
-    files: List[str] = []
-
-    if fmt == "apply_patch":
-        files.extend(re.findall(r"^\*\*\* (?:Update|Add|Delete) File: (.+)$", text, re.M))
-        return files
-
-    if fmt == "unified":
-        plus_lines = re.findall(r"^\+\+\+\s+(.*)$", text, re.M)
-        for line in plus_lines:
-            candidate = line.strip()
-            if candidate == "/dev/null":
-                continue
-            candidate = re.sub(r"^[ab]/", "", candidate)
-            files.append(candidate)
-    return files
-
-
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def snapshot_files(root: Path, relpaths: Sequence[str]) -> Dict[str, FileState]:
-    snap: Dict[str, FileState] = {}
-    for rel in relpaths:
-        path = root / rel
-        if path.exists() and path.is_file():
-            snap[rel] = FileState(True, sha256_file(path), path.stat().st_size)
-        else:
-            snap[rel] = FileState(False, None, None)
-    return snap
-
-
-def diff_snapshot(before: Dict[str, FileState], after: Dict[str, FileState]) -> List[str]:
-    changed: List[str] = []
-    for rel, b in before.items():
-        a = after.get(rel)
-        if a is None:
-            continue
-        if b.exists != a.exists:
-            changed.append(rel)
-            continue
-        if b.exists and a.exists and (b.sha256 != a.sha256 or b.size != a.size):
-            changed.append(rel)
-    return changed
-
-
-def _fix_apply_patch_text(text: str, aggressive_strip_trailing: bool) -> str:
-    lines = text.split("\n")
-    out: List[str] = []
-    in_hunk = False
-
-    def fix_hunk_line(line: str) -> str:
-        if line.strip() == "":
-            return " "
-        if line[:1] in (" ", "+", "-"):
-            marker, rest = line[0], line[1:]
-            if rest.strip() == "":
-                return marker
-            return marker + (rest.rstrip(" \t") if aggressive_strip_trailing else rest)
-        return " " + (line.rstrip(" \t") if aggressive_strip_trailing else line)
-
-    for line in lines:
-        if line.startswith("*** Begin Patch"):
-            in_hunk = False
-            out.append("*** Begin Patch")
-            continue
-        if line.startswith("*** End Patch"):
-            in_hunk = False
-            out.append("*** End Patch")
-            continue
-        if line.startswith("*** Update File:"):
-            in_hunk = False
-            out.append(line.rstrip(" \t") if aggressive_strip_trailing else line)
-            continue
-        if line.startswith("*** Add File:"):
-            in_hunk = False
-            out.append(line.rstrip(" \t") if aggressive_strip_trailing else line)
-            continue
-        if line.startswith("*** Delete File:"):
-            in_hunk = False
-            out.append(line.rstrip(" \t") if aggressive_strip_trailing else line)
-            continue
-        if line.startswith("*** Move to:"):
-            out.append(line.rstrip(" \t") if aggressive_strip_trailing else line)
-            continue
-        if line.startswith("@@"):
-            in_hunk = True
-            out.append(line.rstrip(" \t") if aggressive_strip_trailing else line)
-            continue
-        if in_hunk:
-            out.append(fix_hunk_line(line))
-        else:
-            out.append("" if line.strip() == "" else (line.rstrip(" \t") if aggressive_strip_trailing else line))
-
-    fixed = "\n".join(out)
-    if not fixed.endswith("\n"):
-        fixed += "\n"
-    return fixed
-
-
-def _fix_unified_diff_text(text: str, aggressive_strip_trailing: bool) -> str:
-    lines = text.split("\n")
-    out: List[str] = []
-    for line in lines:
-        if line.startswith(("diff --git", "index ", "--- ", "+++ ", "@@")):
-            out.append(line.rstrip(" \t") if aggressive_strip_trailing else line)
-            continue
-        if line[:1] in (" ", "+", "-"):
-            marker, rest = line[0], line[1:]
-            if rest.strip() == "":
-                out.append(marker)
-            else:
-                out.append(marker + (rest.rstrip(" \t") if aggressive_strip_trailing else rest))
-            continue
-        out.append("" if line.strip() == "" else (line.rstrip(" \t") if aggressive_strip_trailing else line))
-    fixed = "\n".join(out)
-    if not fixed.endswith("\n"):
-        fixed += "\n"
-    return fixed
-
-
-def best_effort_cleanup(text: str, aggressive_strip_trailing: bool) -> str:
-    text = extract_patch_from_markdown(text)
-    text = normalize_newlines(text)
-    fmt = detect_format(text)
-    if fmt == "apply_patch":
-        return _fix_apply_patch_text(text, aggressive_strip_trailing)
-    if fmt == "unified":
-        return _fix_unified_diff_text(text, aggressive_strip_trailing)
-    return text
-
-
-def prompt_yes_no(question: str, default_yes: bool = True) -> bool:
-    prompt = " [Y/n]: " if default_yes else " [y/N]: "
-    while True:
-        try:
-            reply = input(question + prompt).strip().lower()
-        except EOFError:
-            return default_yes
-        if reply == "":
-            return default_yes
-        if reply in {"y", "yes"}:
-            return True
-        if reply in {"n", "no"}:
-            return False
-        print("Please answer y or n.")
-
-
-def apply_with_codex(cap_module, patch_text: str, root: Path, target_files: Sequence[str]) -> ApplyResult:
-    before = snapshot_files(root, target_files)
-    old_cwd = Path.cwd()
-    raw_result = None
-    exception_text = None
     try:
-        os.chdir(root)
-        raw_result = cap_module.apply_patch(patch_text)
-    except Exception:
-        exception_text = traceback.format_exc()
-    finally:
-        os.chdir(old_cwd)
+        sig = inspect.signature(fn)
+        kwargs = {}
+        # Pass a root/workdir if the function accepts it.
+        for name in (
+            "root",
+            "root_dir",
+            "base_dir",
+            "repo_root",
+            "workdir",
+            "cwd",
+            "directory",
+        ):
+            if name in sig.parameters:
+                kwargs[name] = str(Path.cwd())
+                break
 
-    after = snapshot_files(root, target_files)
-    changed = diff_snapshot(before, after)
+        result = fn(patch_text, **kwargs)
 
-    msg_lines = []
-    if raw_result is not None:
-        msg_lines.append(f"apply_patch() return value: {raw_result!r}")
-    else:
-        msg_lines.append("apply_patch() return value: None")
-    if changed:
-        msg_lines.append("Changed files: " + ", ".join(changed))
-    else:
-        msg_lines.append("Changed files: none detected")
-    if exception_text:
-        msg_lines.append("Exception:\n" + exception_text)
+        # Some implementations may return a string or object describing what happened.
+        msg = "Applied patch using codex_apply_patch."
+        if result is not None:
+            msg += f" Returned: {result!r}"
+        return True, msg
+    except Exception as exc:
+        return False, f"codex_apply_patch failed: {exc}"
 
-    ok = exception_text is None and bool(changed)
-    return ApplyResult(ok=ok, changed_files=changed, message="\n".join(msg_lines), exception_text=exception_text)
+
+# ----------------------------
+# CLI
+# ----------------------------
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Apply LLM-generated patches with a standard attempt first, then an optional best-effort retry.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="Apply a unified diff (LLM patch) to the current directory.",
     )
     p.add_argument(
-        "patch",
+        "patchfile",
         nargs="?",
-        help="Patch file to read. Use '-' to read from stdin. Ignored when --clipboard is used.",
+        help="Path to a unified diff file. Omit when using --clipboard.",
     )
     p.add_argument(
         "--clipboard",
         action="store_true",
-        help="Read patch text from the current clipboard instead of from a file or stdin.",
+        help="Read the patch text from the clipboard instead of from a file.",
     )
     p.add_argument(
         "--install-deps",
         action="store_true",
-        help="Install required Python dependencies and exit.",
+        help="Attempt to install optional dependencies (best effort).",
     )
     p.add_argument(
-        "--root",
-        default=".",
-        help="Project root directory where patch paths should be resolved.",
-    )
-    p.add_argument(
-        "--aggressive",
+        "--best-effort",
         action="store_true",
-        help="During best-effort mode, also strip trailing spaces/tabs from patch hunk lines.",
+        help="Skip codex_apply_patch and directly do best-effort apply.",
     )
     p.add_argument(
-        "--no-prompt",
+        "--no-normalize-paths",
         action="store_true",
-        help="If the standard attempt fails or changes nothing, do not ask and exit instead of running best-effort mode.",
+        help="Do not rewrite diff header paths (not recommended for LLM diffs).",
     )
     return p
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = build_arg_parser()
-    args = parser.parse_args(argv)
+def main(argv: Sequence[str]) -> int:
+    args = build_arg_parser().parse_args(list(argv))
 
     if args.install_deps:
-        return install_deps()
+        # Try a couple common names for the codex patcher (we don't assume which exists).
+        # This is intentionally "best-effort" and will just print pip errors if not found.
+        _run_pip_install(["pyperclip"])
+        # Try to install codex_apply_patch under a couple plausible distribution names.
+        # If neither exists on PyPI, pip will report it.
+        _run_pip_install(["codex-apply-patch"])
+        _run_pip_install(["codex_apply_patch"])
 
-    if not args.clipboard and not args.patch:
-        parser.error("you must provide a patch file, '-' for stdin, or use --clipboard")
-
-    root = Path(args.root).resolve()
-    if not root.exists() or not root.is_dir():
-        eprint(f"Project root does not exist or is not a directory: {root}")
-        return 2
-
-    try:
-        patch_text = read_patch_text(args.patch, args.clipboard)
-    except Exception as exc:
-        eprint(f"Could not read patch text: {exc}")
-        return 2
-
-    patch_text = extract_patch_from_markdown(patch_text)
-    patch_text = normalize_newlines(patch_text)
-
-    fmt = detect_format(patch_text)
-    if fmt == "unknown":
-        eprint(
-            "Could not detect patch format. Expected either:\n"
-            "  - OpenAI/Codex apply_patch format (*** Begin Patch ... *** End Patch)\n"
-            "  - Unified diff (diff --git / --- / +++)"
-        )
-        return 2
-
-    try:
-        cap = import_codex_apply_patch()
-    except RuntimeError as exc:
-        eprint(str(exc))
-        return 2
-
-    target_files = parse_target_files(patch_text)
-    if not target_files:
-        print("Warning: no target files were detected from the patch headers.")
-        print("The patch may still apply, but change detection will be limited.")
-
-    print(f"Project root: {root}")
-    print(f"Patch format: {fmt}")
-    if target_files:
-        print("Patch targets:")
-        for rel in target_files:
-            path = root / rel
-            status = "exists" if path.exists() else "missing"
-            print(f"  - {rel} ({status})")
-
-    print("\nStandard attempt: codex_apply_patch.apply_patch(...)\n")
-    first = apply_with_codex(cap, patch_text, root, target_files)
-    print(first.message)
-
-    if first.ok:
-        print("\nPatch applied successfully.")
-        return 0
-
-    print("\nThe standard attempt did not clearly apply the patch.")
-    if args.no_prompt:
-        print("Best-effort mode was not run because --no-prompt was specified.")
-        return 3
-
-    if not prompt_yes_no("Run best-effort cleanup and retry?", default_yes=True):
-        print("Cancelled before best-effort retry.")
-        return 3
-
-    cleaned = best_effort_cleanup(patch_text, aggressive_strip_trailing=args.aggressive)
-    if cleaned == patch_text:
-        print("\nBest-effort cleanup made no text changes, but retrying anyway.\n")
+    if args.clipboard:
+        patch_text = _read_clipboard_text()
     else:
-        print("\nBest-effort cleanup adjusted the patch text. Retrying.\n")
+        if not args.patchfile:
+            _eprint("Error: Provide PATCHFILE or use --clipboard")
+            return 1
+        patch_path = Path(args.patchfile)
+        if not patch_path.exists():
+            _eprint(f"Error: Patch file not found: {patch_path}")
+            return 1
+        patch_text, _ = _read_text_file(patch_path)
 
-    second = apply_with_codex(cap, cleaned, root, target_files)
-    print(second.message)
+    repo_root = Path.cwd()
 
-    if second.ok:
-        print("\nPatch applied successfully in best-effort mode.")
+    if not args.no_normalize_paths:
+        patch_text_norm, mapping = normalize_patch_paths(patch_text, repo_root)
+        if patch_text_norm != patch_text:
+            _eprint("Normalized diff header paths:")
+            # Show only unique mappings.
+            shown = set()
+            for k, v in mapping.items():
+                if k in shown:
+                    continue
+                shown.add(k)
+                if k != v:
+                    _eprint(f"  {k}  ->  {v}")
+            patch_text = patch_text_norm
+
+    if args.best_effort:
+        try:
+            msgs = apply_unified_diff_best_effort(patch_text, repo_root)
+            for m in msgs:
+                print(m)
+            return 0
+        except Exception as exc:
+            _eprint("Best-effort apply failed:", exc)
+            return 1
+
+    ok, msg = try_apply_with_codex_apply_patch(patch_text)
+    if ok:
+        print(msg)
         return 0
 
-    print("\nBest-effort mode still did not clearly apply the patch.")
-    print(
-        "Helpful checks:\n"
-        "  - Are you running this script from the project root, or did you pass --root correctly?\n"
-        "  - Do the target files listed above exist at those exact relative paths?\n"
-        "  - Was the patch already applied?\n"
-        "  - Do the file contents differ from what the patch expects?"
-    )
-    return 4
+    _eprint(msg)
+    if not _prompt_yes_no("Standard apply failed. Attempt best-effort apply?", default_yes=True):
+        _eprint("Aborted.")
+        return 1
+
+    try:
+        msgs = apply_unified_diff_best_effort(patch_text, repo_root)
+        for m in msgs:
+            print(m)
+        return 0
+    except Exception as exc:
+        _eprint("Best-effort apply failed:", exc)
+        return 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))
